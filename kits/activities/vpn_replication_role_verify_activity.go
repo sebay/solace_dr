@@ -54,20 +54,26 @@ func VerifyVPNRoleActivity(
 func ValidateFinalRolesActivity(
 	ctx context.Context,
 	vpn string,
-	oldActive models.MateResult,
-	newActive models.MateResult,
+	oldActive *models.MateResult,
+	newActive *models.MateResult,
 	auth models.BasicAuth,
 ) error {
 
-	if err := VerifyVPNRoleActivity(
-		ctx,
-		oldActive.Host,
-		oldActive.Port,
-		vpn,
-		"standby",
-		auth,
-	); err != nil {
-		return err
+	if oldActive != nil {
+		if err := VerifyVPNRoleActivity(
+			ctx,
+			oldActive.Host,
+			oldActive.Port,
+			vpn,
+			"standby",
+			auth,
+		); err != nil {
+			return err
+		}
+	} else {
+		activity.GetLogger(ctx).Warn(
+			"skipping active site as not present",
+		)
 	}
 
 	if err := VerifyVPNRoleActivity(

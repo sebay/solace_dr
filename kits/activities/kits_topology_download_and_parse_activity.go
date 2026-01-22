@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"kits-worker/kits/config"
 	"kits-worker/kits/models"
 	"net/http"
 	"strings"
@@ -52,17 +53,17 @@ func DownloadAndParseKitsActivity(
 		}
 
 		// Match kits.yaml (allow nested paths)
-		if hdr.Typeflag == tar.TypeReg && strings.HasSuffix(hdr.Name, "kits.yaml") {
+		if hdr.Typeflag == tar.TypeReg && strings.HasSuffix(hdr.Name, config.KIT_MESH_CONFIG_FILE) {
 			kitsYAML, err = io.ReadAll(tr)
 			if err != nil {
-				return nil, fmt.Errorf("failed to read kits.yaml: %w", err)
+				return nil, fmt.Errorf("failed to read %s: %w", config.KIT_MESH_CONFIG_FILE, err)
 			}
 			break
 		}
 	}
 
 	if kitsYAML == nil {
-		return nil, fmt.Errorf("kits.yaml not found in archive")
+		return nil, fmt.Errorf("%s not found in archive", config.KIT_MESH_CONFIG_FILE)
 	}
 
 	var file models.KitsFile

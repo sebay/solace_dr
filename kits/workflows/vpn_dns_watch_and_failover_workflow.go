@@ -10,7 +10,7 @@ import (
 	"go.temporal.io/sdk/workflow"
 )
 
-func VPNDNSWatchAndExecuteVPNFailoverWorkflow(ctx workflow.Context, vpn string, active models.MateResult, standby models.MateResult, auth models.BasicAuth) error {
+func VPNDNSWatchAndExecuteVPNFailoverWorkflow(ctx workflow.Context, vpn string, active *models.MateResult, standby *models.MateResult, auth models.BasicAuth) error {
 	logger := workflow.GetLogger(ctx)
 
 	ao := workflow.ActivityOptions{

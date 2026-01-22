@@ -1,10 +1,13 @@
 package workflows
 
 import (
-	"kits-worker/kits/activities"
-	"kits-worker/kits/models"
+	"errors"
 	"time"
 
+	"kits-worker/kits/activities"
+	"kits-worker/kits/models"
+
+	"go.temporal.io/sdk/temporal"
 	"go.temporal.io/sdk/workflow"
 )
 
@@ -20,43 +23,65 @@ func KitDRWorkflow(
 	}
 	ctx = workflow.WithActivityOptions(ctx, ao)
 
-	// 1. Check mates on dc site
-	var mates []workflow.Future
-	check := func(dc, mate string, ep models.Endpoint) {
-		mates = append(mates,
-			workflow.ExecuteActivity(
-				ctx,
-				activities.CheckMateStatusActivity,
-				kitName,
-				dc,
-				mate,
-				ep,
-				auth,
-			),
-		)
+	checkAO := workflow.ActivityOptions{
+		StartToCloseTimeout: time.Minute,
+		RetryPolicy: &temporal.RetryPolicy{
+			MaximumAttempts: 1, // ⬅️ CRITICAL
+		},
 	}
 
-	check("dc1", "mate1", kit.DC1.Mate1)
-	check("dc1", "mate2", kit.DC1.Mate2)
-	check("dc2", "mate1", kit.DC2.Mate1)
-	check("dc2", "mate2", kit.DC2.Mate2)
+	checkCtx := workflow.WithActivityOptions(ctx, checkAO)
+
+	/*
+		1. Check mates (retry 3 times, ignore failure)
+	*/
+	type mateCheck struct {
+		dc   string
+		mate string
+		ep   models.Endpoint
+	}
+
+	mateChecks := []mateCheck{
+		{"dc1", "mate1", kit.DC1.Mate1},
+		{"dc1", "mate2", kit.DC1.Mate2},
+		{"dc2", "mate1", kit.DC2.Mate1},
+		{"dc2", "mate2", kit.DC2.Mate2},
+	}
 
 	var active []models.MateResult
-	for _, f := range mates {
+
+	for _, mc := range mateChecks {
 		var r models.MateResult
-		if err := f.Get(ctx, &r); err != nil {
-			return nil, err
-		}
-		if r.Status == models.Active {
+		err := workflow.ExecuteActivity(
+			checkCtx,
+			activities.CheckMateStatusActivity,
+			kitName,
+			mc.dc,
+			mc.mate,
+			mc.ep,
+			auth,
+		).Get(checkCtx, &r)
+
+		if err == nil && r.Status == models.Active {
 			active = append(active, r)
 		}
 	}
 
+	if len(active) == 0 {
+		return nil, errors.New("no active mates found after 3 retries")
+	}
+
+	has2ActiveMate := len(active) == 2
+
+	/*
+		2. Build VPN maps from ACTIVE mates
+	*/
 	vpnMapActive := make(map[string]models.MateResult)
 	vpnMapStandby := make(map[string]models.MateResult)
-	// 2. For each ACTIVE mate → get VPNs
+
 	for _, m := range active {
-		var vpns []string
+		// Active VPNs
+		var vpnsActive []string
 		if err := workflow.ExecuteActivity(
 			ctx,
 			activities.GetRoleVPNsActivity,
@@ -64,14 +89,15 @@ func KitDRWorkflow(
 			m.Port,
 			"active",
 			auth,
-		).Get(ctx, &vpns); err != nil {
+		).Get(ctx, &vpnsActive); err != nil {
 			return nil, err
 		}
 
-		for _, vpn := range vpns {
+		for _, vpn := range vpnsActive {
 			vpnMapActive[vpn] = m
 		}
 
+		// Standby VPNs
 		var vpnsStandby []string
 		if err := workflow.ExecuteActivity(
 			ctx,
@@ -89,21 +115,65 @@ func KitDRWorkflow(
 		}
 	}
 
-	// 3. For each VPN → start DNS watcher, passing vpn AND host/port where it is currently active and where it is standby
+	/*
+		3. Start DNS watcher child workflows
+	*/
 	var dnsFutures []workflow.ChildWorkflowFuture
-	for vpn := range vpnMapActive {
-		vpnCopy := vpn
-		activeMate := vpnMapActive[vpnCopy]
-		standbyMate := vpnMapStandby[vpnCopy]
 
-		f := workflow.ExecuteChildWorkflow(ctx, VPNDNSWatchAndExecuteVPNFailoverWorkflow, vpnCopy, activeMate, standbyMate, auth)
-		dnsFutures = append(dnsFutures, f)
+	if has2ActiveMate {
+		// Normal path: VPNs from active map
+		for vpn := range vpnMapActive {
+			vpnCopy := vpn
+			m := vpnMapActive[vpnCopy]
+			activeMate := &m
+			standbyMate := vpnMapStandby[vpnCopy]
+
+			f := workflow.ExecuteChildWorkflow(
+				ctx,
+				VPNDNSWatchAndExecuteVPNFailoverWorkflow,
+				vpnCopy,
+				activeMate,
+				standbyMate,
+				auth,
+			)
+			dnsFutures = append(dnsFutures, f)
+		}
+	} else {
+		if len(vpnMapStandby) == 0 {
+			workflow.GetLogger(ctx).Warn(
+				"There is 1 active mate on active site but standby is not responding. " +
+					"We have no site to failover to. Skipping DR.",
+			)
+		} else {
+			workflow.GetLogger(ctx).Warn(
+				"There is 1 active mate on standby site but primary site is unreachable. " +
+					"Proceeding with activating Standby Site without access to Active Site",
+			)
+			// No active mates at all → VPNs from standby map
+			for vpn := range vpnMapStandby {
+				vpnCopy := vpn
+				var activeMate *models.MateResult = nil
+				standbyMate := vpnMapStandby[vpnCopy]
+
+				f := workflow.ExecuteChildWorkflow(
+					ctx,
+					VPNDNSWatchAndExecuteVPNFailoverWorkflow,
+					vpnCopy,
+					activeMate,
+					standbyMate,
+					auth,
+				)
+				dnsFutures = append(dnsFutures, f)
+			}
+		}
 	}
 
-	// Optional: wait for all to start (or finish if you want)
+	/*
+		4. Optional wait (safe even for long-running children)
+	*/
 	for _, f := range dnsFutures {
-		// Just calling Get yields control; if DNS watchers run infinitely, consider using Get with timeout or skip Get entirely
 		_ = f.Get(ctx, nil)
 	}
+
 	return active, nil
 }

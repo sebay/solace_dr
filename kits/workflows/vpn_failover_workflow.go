@@ -12,8 +12,8 @@ import (
 func VPNFailoverWorkflow(
 	ctx workflow.Context,
 	vpn string,
-	active models.MateResult,
-	standby models.MateResult,
+	active *models.MateResult,
+	standby *models.MateResult,
 	auth models.BasicAuth,
 ) error {
 
@@ -26,34 +26,40 @@ func VPNFailoverWorkflow(
 	ctx = workflow.WithActivityOptions(ctx, ao)
 
 	// 1) ACTIVE → STANDBY
-	if err := workflow.ExecuteActivity(
-		ctx,
-		activities.SetVPNReplicationRoleActivity,
-		active.Host,
-		active.Port,
-		vpn,
-		"standby",
-		auth,
-	).Get(ctx, nil); err != nil {
-		return err
-	}
+	if active != nil {
+		if err := workflow.ExecuteActivity(
+			ctx,
+			activities.SetVPNReplicationRoleActivity,
+			active.Host,
+			active.Port,
+			vpn,
+			"standby",
+			auth,
+		).Get(ctx, nil); err != nil {
+			return err
+		}
 
-	// 2) Monitor replication queue (12 retries, 5s)
-	if err := workflow.ExecuteActivity(
-		workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
-			StartToCloseTimeout: 70 * time.Second,
-			RetryPolicy: &temporal.RetryPolicy{
-				MaximumAttempts: 12,
-				InitialInterval: 5 * time.Second,
-			},
-		}),
-		activities.WaitForReplicationDrainActivity,
-		active.Host,
-		active.Port,
-		vpn,
-		auth,
-	).Get(ctx, nil); err != nil {
-		return err
+		// 2) Monitor replication queue (12 retries, 5s)
+		if err := workflow.ExecuteActivity(
+			workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
+				StartToCloseTimeout: 70 * time.Second,
+				RetryPolicy: &temporal.RetryPolicy{
+					MaximumAttempts: 12,
+					InitialInterval: 5 * time.Second,
+				},
+			}),
+			activities.WaitForReplicationDrainActivity,
+			active.Host,
+			active.Port,
+			vpn,
+			auth,
+		).Get(ctx, nil); err != nil {
+			return err
+		}
+	} else {
+		workflow.GetLogger(ctx).Warn(
+			"skipping active site as not present",
+		)
 	}
 
 	// 3) Verify VPN is standby on other DC
